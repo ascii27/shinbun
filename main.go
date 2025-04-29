@@ -3,12 +3,13 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"flag"
 	"fmt"
-	"log"
 	"net/smtp"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,14 +24,15 @@ import (
 )
 
 type Config struct {
-	SlackToken     string
-	OpenAIToken    string
-	DBHost         string
-	DBPort         string
-	DBName         string
-	DBUser         string
-	DBPassword     string
-	SourceChannels []string
+	SlackToken           string
+	OpenAIToken          string
+	DBHost               string
+	DBPort               string
+	DBName               string
+	DBUser               string
+	DBPassword           string
+	DefaultFocusChannels []string
+	SupportFocusChannels []string
 	// Email configuration
 	SMTPHost     string
 	SMTPPort     string
@@ -40,17 +42,39 @@ type Config struct {
 	EmailTo      []string
 }
 
+type Flags struct {
+	ListChannels bool
+	Focus        string
+	FromDateStr  string
+	DryRun       bool
+}
+
+type Update struct {
+	Text      string
+	Timestamp string
+	Link      string
+	Channel   string
+	Category  string
+	Priority  int
+}
+
 func loadConfig() (*Config, error) {
 	err := godotenv.Load()
 	if err != nil {
 		return nil, fmt.Errorf("error loading .env file: %v", err)
 	}
 
-	channelsStr := os.Getenv("SOURCE_CHANNELS")
-	if channelsStr == "" {
-		return nil, fmt.Errorf("SOURCE_CHANNELS environment variable is required")
+	defaultChannelsStr := os.Getenv("DEFAULT_FOCUS_CHANNELS")
+	if defaultChannelsStr == "" {
+		return nil, fmt.Errorf("DEFAULT_FOCUS_CHANNELS environment variable is required")
 	}
-	channels := strings.Split(channelsStr, ",")
+	defaultChannels := strings.Split(defaultChannelsStr, ",")
+
+	supportChannelsStr := os.Getenv("SUPPORT_FOCUS_CHANNELS")
+	var supportChannels []string
+	if supportChannelsStr != "" {
+		supportChannels = strings.Split(supportChannelsStr, ",")
+	}
 
 	emailToStr := os.Getenv("EMAIL_TO")
 	var emailTo []string
@@ -59,21 +83,21 @@ func loadConfig() (*Config, error) {
 	}
 
 	config := &Config{
-		SlackToken:     os.Getenv("SLACK_BOT_TOKEN"),
-		OpenAIToken:    os.Getenv("OPENAI_API_KEY"),
-		DBHost:         os.Getenv("DB_HOST"),
-		DBPort:         os.Getenv("DB_PORT"),
-		DBName:         os.Getenv("DB_NAME"),
-		DBUser:         os.Getenv("DB_USER"),
-		DBPassword:     os.Getenv("DB_PASSWORD"),
-		SourceChannels: channels,
-		// Email configuration
-		SMTPHost:     os.Getenv("SMTP_HOST"),
-		SMTPPort:     os.Getenv("SMTP_PORT"),
-		SMTPUser:     os.Getenv("SMTP_USER"),
-		SMTPPassword: os.Getenv("SMTP_PASSWORD"),
-		EmailFrom:    os.Getenv("EMAIL_FROM"),
-		EmailTo:      emailTo,
+		SlackToken:           os.Getenv("SLACK_BOT_TOKEN"),
+		OpenAIToken:          os.Getenv("OPENAI_API_KEY"),
+		DBHost:               os.Getenv("DB_HOST"),
+		DBPort:               os.Getenv("DB_PORT"),
+		DBName:               os.Getenv("DB_NAME"),
+		DBUser:               os.Getenv("DB_USER"),
+		DBPassword:           os.Getenv("DB_PASSWORD"),
+		DefaultFocusChannels: defaultChannels,
+		SupportFocusChannels: supportChannels,
+		SMTPHost:             os.Getenv("SMTP_HOST"),
+		SMTPPort:             os.Getenv("SMTP_PORT"),
+		SMTPUser:             os.Getenv("SMTP_USER"),
+		SMTPPassword:         os.Getenv("SMTP_PASSWORD"),
+		EmailFrom:            os.Getenv("EMAIL_FROM"),
+		EmailTo:              emailTo,
 	}
 
 	required := map[string]string{
@@ -95,13 +119,43 @@ func loadConfig() (*Config, error) {
 	return config, nil
 }
 
-type Update struct {
-	Text      string
-	Timestamp string
-	Link      string
-	Channel   string
-	Category  string
-	Priority  int
+func parseFromDate(fromDateStr string) (time.Time, error) {
+	if fromDateStr == "" {
+		return time.Time{}, nil
+	}
+
+	layout := "2006-01-02"
+	t, err := time.Parse(layout, fromDateStr)
+	if err == nil {
+		year, month, day := t.Date()
+		return time.Date(year, month, day, 0, 0, 0, 0, time.Local), nil
+	}
+
+	// Try parsing as a duration relative to now (e.g., "24h", "168h", "7d")
+	// Handle "d" for days separately as time.ParseDuration doesn't support it
+	if strings.HasSuffix(fromDateStr, "d") {
+		daysStr := strings.TrimSuffix(fromDateStr, "d")
+		days, err := strconv.Atoi(daysStr)
+		if err == nil && days > 0 {
+			// Convert days to hours
+			hours := days * 24
+			fromDateStr = fmt.Sprintf("%dh", hours)
+		} else {
+			// Invalid number of days format
+			return time.Time{}, errors.New("invalid day format in --from-date duration")
+		}
+	}
+
+	// Now parse the duration (original or converted from days)
+	dur, err := time.ParseDuration(fromDateStr)
+	if err == nil {
+		if dur > 0 {
+			dur = -dur
+		}
+		return time.Now().Add(dur), nil
+	}
+
+	return time.Time{}, errors.New("invalid --from-date format. Use YYYY-MM-DD or duration (e.g., 24h, 7d)")
 }
 
 func connectDB(config *Config) (*sql.DB, error) {
@@ -120,24 +174,19 @@ func connectDB(config *Config) (*sql.DB, error) {
 	return db, nil
 }
 
-func getChannelID(api *slack.Client, db *sql.DB, channelName string, logger *zap.Logger) (string, error) {
-	// First try to get the channel ID from the database
-	var slackID string
-	query := `SELECT slack_id FROM channels WHERE name = $1`
-	err := db.QueryRow(query, channelName).Scan(&slackID)
+func getChannelID(api *slack.Client, db *sql.DB, channelName string, logger *zap.Logger) (slackID string, dbID int, err error) {
+	query := `SELECT id, slack_id FROM channels WHERE name = $1`
+	err = db.QueryRow(query, channelName).Scan(&dbID, &slackID)
 	if err == nil {
-		logger.Debug("Found channel ID in database",
+		logger.Debug("Found channel in database",
 			zap.String("channel_name", channelName),
-			zap.String("slack_id", slackID))
-		return slackID, nil
+			zap.String("slack_id", slackID),
+			zap.Int("db_id", dbID))
+		return slackID, dbID, nil
 	}
 	if err != sql.ErrNoRows {
-		return "", fmt.Errorf("error querying channel from database: %v", err)
+		return "", 0, fmt.Errorf("error querying channel from database: %v", err)
 	}
-
-	// If not in database, fetch it from Slack
-	logger.Info("Channel not found in database, fetching from Slack",
-		zap.String("channel_name", channelName))
 
 	params := &slack.GetConversationsParameters{
 		ExcludeArchived: true,
@@ -148,7 +197,7 @@ func getChannelID(api *slack.Client, db *sql.DB, channelName string, logger *zap
 	for {
 		channels, nextCursor, err := api.GetConversations(params)
 		if err != nil {
-			return "", fmt.Errorf("error getting conversations: %v", err)
+			return "", 0, fmt.Errorf("error getting conversations: %v", err)
 		}
 
 		for _, channel := range channels {
@@ -157,15 +206,13 @@ func getChannelID(api *slack.Client, db *sql.DB, channelName string, logger *zap
 					zap.String("channel_name", channelName),
 					zap.String("channel_id", channel.ID))
 
-				// Store in database for future use
-				_, err := upsertChannel(db, channel.ID, channelName, logger)
+				dbID, err := upsertChannel(db, channel.ID, channelName, logger)
 				if err != nil {
 					logger.Error("Failed to store channel in database",
 						zap.String("channel_name", channelName),
 						zap.Error(err))
 				}
-
-				return channel.ID, nil
+				return channel.ID, dbID, nil
 			}
 		}
 
@@ -175,7 +222,7 @@ func getChannelID(api *slack.Client, db *sql.DB, channelName string, logger *zap
 		params.Cursor = nextCursor
 	}
 
-	return "", fmt.Errorf("channel %s not found", channelName)
+	return "", 0, fmt.Errorf("channel %s not found", channelName)
 }
 
 func upsertChannel(db *sql.DB, slackID, name string, logger *zap.Logger) (int, error) {
@@ -210,7 +257,6 @@ func getLastFetchTime(db *sql.DB, channelID int, logger *zap.Logger) (time.Time,
 	}
 
 	if !lastFetched.Valid {
-		// If no last fetch time, return a time far in the past
 		return time.Now().AddDate(0, 0, -7), nil
 	}
 
@@ -230,7 +276,6 @@ func updateLastFetchTime(db *sql.DB, channelID int, logger *zap.Logger) error {
 }
 
 func saveMessage(db *sql.DB, channelID int, msg Update, logger *zap.Logger) error {
-	// Parse the Slack timestamp to a time.Time
 	msgTime, err := formatTimestamp(msg.Timestamp)
 	if err != nil {
 		return fmt.Errorf("error parsing timestamp: %v", err)
@@ -288,74 +333,93 @@ func getMessagesFromDB(db *sql.DB, channelID int, since time.Time, logger *zap.L
 
 func summarizeChannel(api *slack.Client, db *sql.DB, channelID string, channelName string, since time.Time, logger *zap.Logger) ([]Update, error) {
 	var updates []Update
+	// Aggregate stats across pages
+	totalMessagesFetched := 0
+	totalSkippedBots := 0
+	totalThreadReplies := 0
+	totalProcessedMessages := 0
+	cursor := "" // Start with no cursor
 
-	history, err := api.GetConversationHistory(&slack.GetConversationHistoryParameters{
-		ChannelID: channelID,
-		Oldest:    fmt.Sprintf("%d", since.Unix()),
-		Limit:     100,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("error getting channel history: %v", err)
-	}
-
-	skippedBots := 0
-	threadReplies := 0
-	processedMessages := 0
-
-	for _, msg := range history.Messages {
-		// Skip bot messages
-		if msg.BotID != "" {
-			skippedBots++
-			continue
+	for {
+		params := &slack.GetConversationHistoryParameters{
+			ChannelID: channelID,
+			Oldest:    fmt.Sprintf("%d", since.Unix()),
+			Limit:     200, // Increased limit
+			Cursor:    cursor,
 		}
-
-		// Skip thread replies (only process parent messages)
-		if msg.ThreadTimestamp != "" && msg.ThreadTimestamp != msg.Timestamp {
-			threadReplies++
-			continue
-		}
-
-		// Get permalink to message
-		permalink, err := api.GetPermalink(&slack.PermalinkParameters{
-			Channel: channelID,
-			Ts:      msg.Timestamp,
-		})
+		history, err := api.GetConversationHistory(params)
 		if err != nil {
-			logger.Warn("Couldn't get permalink for message",
-				zap.String("channel_name", channelName),
-				zap.String("timestamp", msg.Timestamp),
-				zap.Error(err))
-			permalink = "N/A"
+			return nil, fmt.Errorf("error getting channel history (cursor: %s): %v", cursor, err)
 		}
 
-		category, priority := categorizeMessage(channelName, msg.Text)
-		updates = append(updates, Update{
-			Text:      msg.Text,
-			Timestamp: msg.Timestamp,
-			Link:      permalink,
-			Channel:   channelName,
-			Category:  category,
-			Priority:  priority,
-		})
-		processedMessages++
+		totalMessagesFetched += len(history.Messages)
+		pageSkippedBots := 0
+		pageThreadReplies := 0
+		pageProcessedMessages := 0
+
+		// Process messages from the current page
+		for _, msg := range history.Messages {
+			// Skip bots, non-messages, and thread replies
+			if msg.BotID != "" || msg.Type != "message" || (msg.ThreadTimestamp != "" && msg.ThreadTimestamp != msg.Timestamp) {
+				if msg.BotID != "" || msg.Type != "message" {
+					pageSkippedBots++
+				}
+				if msg.ThreadTimestamp != "" && msg.ThreadTimestamp != msg.Timestamp {
+					pageThreadReplies++
+				}
+				continue
+			}
+
+			permalink, err := api.GetPermalink(&slack.PermalinkParameters{
+				Channel: channelID,
+				Ts:      msg.Timestamp,
+			})
+			if err != nil {
+				logger.Warn("Couldn't get permalink for message",
+					zap.String("channel_name", channelName),
+					zap.String("timestamp", msg.Timestamp),
+					zap.Error(err))
+				permalink = "N/A" // Keep original behavior
+			}
+
+			category, priority := categorizeMessage(channelName, msg.Text)
+			updates = append(updates, Update{
+				Text:      msg.Text,
+				Timestamp: msg.Timestamp,
+				Link:      permalink,
+				Channel:   channelName,
+				Category:  category,
+				Priority:  priority,
+			})
+			pageProcessedMessages++
+		}
+
+		// Accumulate stats for this page
+		totalSkippedBots += pageSkippedBots
+		totalThreadReplies += pageThreadReplies
+		totalProcessedMessages += pageProcessedMessages
+
+		// Check if we need to fetch more pages
+		if !history.HasMore || history.ResponseMetaData.NextCursor == "" {
+			break // Exit loop if no more pages
+		}
+		cursor = history.ResponseMetaData.NextCursor // Set cursor for the next iteration
 	}
 
-	logger.Info("Processed messages",
+	logger.Info("Processed messages from channel",
 		zap.String("channel_name", channelName),
-		zap.Int("total_messages", len(history.Messages)),
-		zap.Int("skipped_bots", skippedBots),
-		zap.Int("thread_replies", threadReplies),
-		zap.Int("processed_messages", processedMessages))
+		zap.Int("total_messages_fetched", totalMessagesFetched),
+		zap.Int("skipped_bots", totalSkippedBots),
+		zap.Int("thread_replies", totalThreadReplies),
+		zap.Int("processed_messages", totalProcessedMessages))
 
 	return updates, nil
 }
 
 func categorizeMessage(channelName string, text string) (category string, priority int) {
-	// Default to general category with low priority
 	category = "general"
 	priority = 1
 
-	// Check channel name for categorization
 	switch {
 	case strings.Contains(channelName, "alert") || strings.Contains(channelName, "incident"):
 		category = "alert"
@@ -365,7 +429,6 @@ func categorizeMessage(channelName string, text string) (category string, priori
 		priority = 2
 	}
 
-	// Check message content for additional prioritization
 	lowercaseText := strings.ToLower(text)
 	urgentTerms := []string{"urgent", "emergency", "critical", "outage", "down", "broken", "failed", "error"}
 	for _, term := range urgentTerms {
@@ -385,13 +448,11 @@ func min(a, b int) int {
 }
 
 func formatMessage(text string) string {
-	// Remove Slack formatting
 	text = strings.ReplaceAll(text, "*", "")
 	text = strings.ReplaceAll(text, "_", "")
 	text = strings.ReplaceAll(text, "`", "")
 	text = strings.ReplaceAll(text, "•", "-")
 
-	// Clean up newlines
 	text = strings.ReplaceAll(text, "\n\n\n", "\n")
 	text = strings.ReplaceAll(text, "\n\n", "\n")
 
@@ -404,23 +465,19 @@ func formatTimestamp(timestamp string) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("error parsing timestamp: %v", err)
 	}
 
-	// Load JST timezone
 	jst, err := time.LoadLocation("Asia/Tokyo")
 	if err != nil {
 		return time.Time{}, fmt.Errorf("error loading JST timezone: %v", err)
 	}
 
-	// Convert Unix timestamp to JST
 	return time.Unix(int64(tsFloat), 0).In(jst), nil
 }
 
-func generateSummary(client *openai.Client, updates []Update, logger *zap.Logger) (string, error) {
-	// Sort updates by priority
+func generateSummary(client *openai.Client, updates []Update, focus string, logger *zap.Logger) (string, error) {
 	sort.Slice(updates, func(i, j int) bool {
 		return updates[i].Priority > updates[j].Priority
 	})
 
-	// Group updates by category
 	var alertUpdates []Update
 	var supportUpdates []Update
 	var generalUpdates []Update
@@ -443,7 +500,6 @@ func generateSummary(client *openai.Client, updates []Update, logger *zap.Logger
 	var sb strings.Builder
 	sb.WriteString("Here are the messages from the last week, grouped by category:\n\n")
 
-	// Helper function to write updates
 	writeUpdates := func(updates []Update, section string) {
 		if len(updates) > 0 {
 			sb.WriteString(fmt.Sprintf("%s:\n", section))
@@ -462,19 +518,43 @@ func generateSummary(client *openai.Client, updates []Update, logger *zap.Logger
 		}
 	}
 
-	// Write updates for each category
 	writeUpdates(highPriorityUpdates, "High Priority Messages")
 	writeUpdates(alertUpdates, "Alert Messages")
 	writeUpdates(supportUpdates, "Support Messages")
 	writeUpdates(generalUpdates, "General Messages")
 
-	prompt := `You are an assistant that is providing me with important updates and information. You are going to give me key information for the week prior. I like my information presented
+	var prompt string
+	var systemMessage string
+
+	switch focus {
+	case "support":
+		systemMessage = `You are a highly efficient support team assistant. You analyze Slack messages from support channels and provide a concise, actionable summary focused on customer issues, escalations, and resolutions. Prioritize clarity and urgency.`
+		prompt = `Summarize the following support-related messages. Structure the summary into these sections:
+
+1.  **Critical/Urgent Issues:** Bullet points for any urgent matters needing immediate attention.
+2.  **New Support Requests:** Briefly list new issues raised.
+3.  **Updates & Resolutions:** Summarize progress on ongoing issues or confirmed resolutions.
+4.  **Statistics:** Provide a brief statistical overview including: the total number of requests/messages summarized, a breakdown of request types (if possible), components frequently mentioned, and teams involved/mentioned.
+
+IMPORTANT: Each message below includes a \"Link:\" field containing the exact Slack message URL. When referencing messages, MUST use these exact URLs in markdown links: [Description](exact-slack-url).
+
+Use a professional and direct tone. Focus on actionable information.
+
+Current time for context: ` + time.Now().Format("2006-01-02 15:04 JST") + `.
+
+Messages:
+` + sb.String() + `
+Please provide the support-focused summary.`
+
+	default: // Default focus
+		systemMessage = `You are a helpful assistant providing a fun, newspaper-style summary of Slack channel updates. Highlight key info and urgent items clearly.`
+		prompt = `You are an assistant that is providing me with important updates and information. You are going to give me key information for the week prior. I like my information presented
 like a newspaper, with key information at the top, important highlights, and any urgent topics clearly called out. The remaining information should
 be presented as a short summary with key highlights or takeaways that I should be aware of.
 
 Each message includes a timestamp in JST (Japan Standard Time). Use these timestamps to provide accurate timing information in your summary.
 For example, if a message is from "2025-02-01 14:30:00 JST", say "yesterday at 2:30 PM" or "on February 1st" as appropriate.
-The current time is ` + time.Now().Format("2025-02-02 15:04:05 JST") + `.
+The current time is ` + time.Now().Format("2006-01-02 15:04:05 JST") + `.
 
 Structure the summary in the following sections:
 
@@ -483,9 +563,7 @@ Structure the summary in the following sections:
 3. "General Updates" - Group and summarize other interesting topics and announcements, provide any takeaways.
 4. "Support and Incident Summary" - Provide an overview of support requests and incidents, provide any takeaways and identify any follow up actions that I need.
 
-IMPORTANT: Each message below includes a "Link:" field containing the exact Slack message URL. When referencing messages in your summary, you MUST use these exact URLs in your markdown links. Do not modify the URLs or use placeholders. Format your links as [Message Description](exact-slack-url-from-message).
-
-Format the response in Markdown, and when including links, use proper markdown link syntax: [description](url)
+IMPORTANT: Each message below includes a "Link:" field containing the exact Slack message URL. When referencing messages in your summary, you MUST use these exact URLs in your markdown links. Do not modify the URLs or use placeholders. Format your links as [description](url)
 
 After you create your summary, review the above context to make sure the summary meets those expectations both in terms of format and content. 
 Also you need to double-check that the links to the slack message are correct and working links. They should be exactly the link provided in the 'Link:' field.
@@ -493,11 +571,15 @@ Also you need to double-check that the links to the slack message are correct an
 As for the tone, I want you to sound cheery and bright. Make it happy and fun to read with little jokes and fun comments.
 
 Messages to summarize:
-` + sb.String() + "\n\nPlease summarize these messages, making sure to use the exact Slack message URLs provided in the Link: fields above."
+` + sb.String() + `
 
-	logger.Info("Prompt to Open AI:" + prompt)
+Please summarize these messages, making sure to use the exact Slack message URLs provided in the Link: fields above.` // End of prompt assignment
+
+	}
+	logger.Debug("Prompt to OpenAI", zap.String("focus", focus), zap.String("system_message", systemMessage), zap.String("user_prompt_prefix", prompt[:min(500, len(prompt))])) // Log prefix only
 
 	logger.Info("Generating summary with OpenAI",
+		zap.String("focus", focus),
 		zap.Int("message_count", len(updates)))
 
 	resp, err := client.CreateChatCompletion(
@@ -507,7 +589,7 @@ Messages to summarize:
 			Messages: []openai.ChatCompletionMessage{
 				{
 					Role:    openai.ChatMessageRoleSystem,
-					Content: `You are an assistant that provides important updates and information in a newspaper style format. You analyze Slack messages and present key information, with a focus on highlighting urgent matters and providing clear takeaways.`,
+					Content: systemMessage, // Use the selected system message
 				},
 				{
 					Role:    openai.ChatMessageRoleUser,
@@ -563,12 +645,10 @@ func listChannels(api *slack.Client, logger *zap.Logger) error {
 }
 
 func markdownToHTML(md string) string {
-	// Create markdown parser with extensions
 	extensions := parser.CommonExtensions | parser.AutoHeadingIDs | parser.NoEmptyLineBeforeBlock
 	p := parser.NewWithExtensions(extensions)
 	doc := p.Parse([]byte(md))
 
-	// Create HTML renderer with extensions
 	htmlFlags := html.CommonFlags | html.HrefTargetBlank
 	opts := html.RendererOptions{Flags: htmlFlags}
 	renderer := html.NewRenderer(opts)
@@ -589,10 +669,8 @@ func sendEmail(config *Config, subject, body string, logger *zap.Logger) error {
 
 	auth := smtp.PlainAuth("", config.SMTPUser, config.SMTPPassword, config.SMTPHost)
 
-	// Convert markdown to HTML
 	htmlBody := markdownToHTML(body)
 
-	// Add CSS styling
 	styledHTML := fmt.Sprintf(`
 <!DOCTYPE html>
 <html>
@@ -648,7 +726,6 @@ func sendEmail(config *Config, subject, body string, logger *zap.Logger) error {
 </body>
 </html>`, htmlBody)
 
-	// Format email headers
 	headers := make(map[string]string)
 	headers["From"] = config.EmailFrom
 	headers["To"] = strings.Join(config.EmailTo, ", ")
@@ -656,7 +733,6 @@ func sendEmail(config *Config, subject, body string, logger *zap.Logger) error {
 	headers["MIME-Version"] = "1.0"
 	headers["Content-Type"] = "text/html; charset=UTF-8"
 
-	// Build email message
 	var message strings.Builder
 	for key, value := range headers {
 		message.WriteString(fmt.Sprintf("%s: %s\r\n", key, value))
@@ -664,7 +740,6 @@ func sendEmail(config *Config, subject, body string, logger *zap.Logger) error {
 	message.WriteString("\r\n")
 	message.WriteString(styledHTML)
 
-	// Send email
 	err := smtp.SendMail(
 		fmt.Sprintf("%s:%s", config.SMTPHost, config.SMTPPort),
 		auth,
@@ -682,105 +757,118 @@ func sendEmail(config *Config, subject, body string, logger *zap.Logger) error {
 }
 
 func main() {
-	// Parse command line flags
-	listFlag := flag.Bool("list", false, "List available channels")
+	flags := Flags{}
+	flag.BoolVar(&flags.ListChannels, "list-channels", false, "List available Slack channels and exit")
+	flag.StringVar(&flags.Focus, "focus", "default", "Specify the channel focus category (e.g., 'default', 'support')")
+	flag.StringVar(&flags.FromDateStr, "from-date", "", "Fetch messages starting from this date (YYYY-MM-DD) or duration (e.g., '24h', '7d'). Defaults to last fetch time.")
+	flag.BoolVar(&flags.DryRun, "dry-run", false, "Run without sending email")
 	flag.Parse()
 
-	// Initialize logger
-	logger, err := zap.NewDevelopment()
-	if err != nil {
-		log.Fatalf("Failed to initialize logger: %v", err)
-	}
-	defer logger.Sync()
+	logger, _ := zap.NewProduction()
 
-	// Load configuration
 	config, err := loadConfig()
 	if err != nil {
 		logger.Fatal("Failed to load configuration", zap.Error(err))
 	}
 
-	// Initialize Slack client
-	slackAPI := slack.New(config.SlackToken)
-
-	// Connect to database (needed for both modes)
 	db, err := connectDB(config)
 	if err != nil {
 		logger.Fatal("Failed to connect to database", zap.Error(err))
 	}
 	defer db.Close()
 
-	// Handle list flag
-	if *listFlag {
-		if err := listChannels(slackAPI, logger); err != nil {
+	fromDate, err := parseFromDate(flags.FromDateStr)
+	if err != nil {
+		logger.Fatal("Invalid --from-date value", zap.Error(err))
+	}
+
+	api := slack.New(config.SlackToken)
+
+	if flags.ListChannels {
+		if err := listChannels(api, logger); err != nil {
 			logger.Fatal("Failed to list channels", zap.Error(err))
 		}
 		return
 	}
 
-	// Initialize OpenAI client
-	openaiAPI := openai.NewClient(config.OpenAIToken)
+	var targetChannels []string
+	switch flags.Focus {
+	case "support":
+		targetChannels = config.SupportFocusChannels
+		if len(targetChannels) == 0 {
+			logger.Fatal("Focus 'support' selected, but SUPPORT_FOCUS_CHANNELS is not defined or empty in .env")
+		}
+	case "default":
+		targetChannels = config.DefaultFocusChannels
+	default:
+		logger.Warn("Unknown focus specified, using default channels", zap.String("focus", flags.Focus))
+		targetChannels = config.DefaultFocusChannels
+	}
 
-	logger.Info("Processing channels", zap.Strings("channels", config.SourceChannels))
+	logger.Info("Starting shinbun process",
+		zap.String("focus", flags.Focus),
+		zap.Strings("channels", targetChannels),
+		zap.String("from_date_flag", flags.FromDateStr),
+		zap.Time("parsed_from_date", fromDate),
+		zap.Bool("dry_run", flags.DryRun),
+	)
+
+	client := openai.NewClient(config.OpenAIToken)
+
 	var allUpdates []Update
 	var totalMessagesSaved int
 
-	// Process each configured channel
-	for _, channelName := range config.SourceChannels {
+	for _, channelName := range targetChannels {
 		channelName = strings.TrimSpace(channelName)
 		if channelName == "" {
 			continue
 		}
 
-		// Get Slack channel ID (from database or Slack API)
-		id, err := getChannelID(slackAPI, db, channelName, logger)
+		logger.Info("Fetching channel ID", zap.String("channel", channelName))
+		channelSlackID, channelDbID, err := getChannelID(api, db, channelName, logger)
 		if err != nil {
-			logger.Error("Failed to get channel ID",
-				zap.String("channel_name", channelName),
-				zap.Error(err))
+			logger.Error("Failed to get channel ID", zap.String("channel", channelName), zap.Error(err))
+			continue // Skip this channel if we can't get its ID
+		}
+
+		var since time.Time
+		if !fromDate.IsZero() {
+			since = fromDate
+			logger.Info("Using --from-date flag for fetch start time",
+				zap.String("channel", channelName),
+				zap.Time("since", since))
+		} else {
+			lastFetch, err := getLastFetchTime(db, channelDbID, logger)
+			if err != nil {
+				logger.Error("Failed to get last fetch time", zap.String("channel", channelName), zap.Error(err))
+				lastFetch = time.Now().Add(-24 * time.Hour)
+				logger.Warn("Defaulting fetch time to 24 hours ago", zap.String("channel", channelName))
+			}
+			since = lastFetch
+			logger.Info("Using last fetch time from database for fetch start time",
+				zap.String("channel", channelName),
+				zap.Time("since", since))
+		}
+
+		logger.Info("Summarizing channel",
+			zap.String("channel", channelName),
+		)
+
+		slackUpdates, err := summarizeChannel(api, db, channelSlackID, channelName, since, logger)
+		if err != nil {
+			logger.Error("Failed to summarize channel", zap.String("channel", channelName), zap.Error(err))
 			continue
 		}
 
-		// Get last fetch time
-		dbChannelID, err := upsertChannel(db, id, channelName, logger)
+		dbUpdates, err := getMessagesFromDB(db, channelDbID, time.Now().AddDate(0, 0, -7), logger)
 		if err != nil {
-			logger.Error("Failed to upsert channel",
-				zap.String("channel_name", channelName),
-				zap.Error(err))
+			logger.Error("Failed to get messages from database", zap.String("channel", channelName), zap.Error(err))
 			continue
 		}
 
-		lastFetch, err := getLastFetchTime(db, dbChannelID, logger)
-		if err != nil {
-			logger.Error("Failed to get last fetch time",
-				zap.String("channel_name", channelName),
-				zap.Error(err))
-			continue
-		}
-
-		// Get updates since last fetch from Slack
-		slackUpdates, err := summarizeChannel(slackAPI, db, id, channelName, lastFetch, logger)
-		if err != nil {
-			logger.Error("Failed to summarize channel",
-				zap.String("channel_name", channelName),
-				zap.Error(err))
-			continue
-		}
-
-		// Get messages from the last week from database
-		oneWeekAgo := time.Now().AddDate(0, 0, -7)
-		dbUpdates, err := getMessagesFromDB(db, dbChannelID, oneWeekAgo, logger)
-		if err != nil {
-			logger.Error("Failed to get messages from database",
-				zap.String("channel_name", channelName),
-				zap.Error(err))
-			continue
-		}
-
-		// Combine updates, avoiding duplicates
-		seenMessages := make(map[string]bool)
 		var updates []Update
+		seenMessages := make(map[string]bool)
 
-		// Add Slack updates first (they're newer)
 		for _, update := range slackUpdates {
 			if !seenMessages[update.Timestamp] {
 				seenMessages[update.Timestamp] = true
@@ -788,7 +876,6 @@ func main() {
 			}
 		}
 
-		// Add database updates
 		for _, update := range dbUpdates {
 			if !seenMessages[update.Timestamp] {
 				seenMessages[update.Timestamp] = true
@@ -797,36 +884,33 @@ func main() {
 		}
 
 		logger.Info("Processing messages for channel",
-			zap.String("channel_name", channelName),
+			zap.String("channel", channelName),
 			zap.Int("total_messages", len(updates)),
 			zap.Int("new_messages", len(slackUpdates)),
-			zap.Int("db_messages", len(dbUpdates)))
+			zap.Int("db_messages", len(dbUpdates)),
+		)
 
 		messagesSaved := 0
-		// Save only new messages to database
 		for _, update := range slackUpdates {
-			if err := saveMessage(db, dbChannelID, update, logger); err != nil {
-				logger.Error("Failed to save message",
-					zap.String("channel_name", channelName),
-					zap.Error(err))
+			if err := saveMessage(db, channelDbID, update, logger); err != nil {
+				logger.Error("Failed to save message", zap.String("channel", channelName), zap.Error(err))
 				continue
 			}
 			messagesSaved++
 		}
 
 		logger.Info("Saved messages for channel",
-			zap.String("channel_name", channelName),
+			zap.String("channel", channelName),
 			zap.Int("messages_saved", messagesSaved),
-			zap.Int("total_messages", len(updates)))
+			zap.Int("total_messages", len(updates)),
+		)
 
 		totalMessagesSaved += messagesSaved
 
-		// Only update last fetch time if we successfully saved messages
 		if messagesSaved > 0 {
-			if err := updateLastFetchTime(db, dbChannelID, logger); err != nil {
-				logger.Error("Failed to update last fetch time",
-					zap.String("channel_name", channelName),
-					zap.Error(err))
+			err = updateLastFetchTime(db, channelDbID, logger)
+			if err != nil {
+				logger.Error("Failed to update last fetch time", zap.String("channel", channelName), zap.Error(err))
 			}
 		}
 
@@ -835,16 +919,16 @@ func main() {
 
 	logger.Info("Finished processing all channels",
 		zap.Int("total_messages_saved", totalMessagesSaved),
-		zap.Int("total_updates", len(allUpdates)))
+		zap.Int("total_updates", len(allUpdates)),
+	)
 
 	if len(allUpdates) == 0 {
-		logger.Info("No new messages found")
+		logger.Info("No updates found across monitored channels.")
 		fmt.Println("\nNo new messages found in the last week.")
 		return
 	}
 
-	// Generate summary using OpenAI
-	summary, err := generateSummary(openaiAPI, allUpdates, logger)
+	summary, err := generateSummary(client, allUpdates, flags.Focus, logger)
 	if err != nil {
 		logger.Fatal("Failed to generate summary", zap.Error(err))
 	}
@@ -852,11 +936,17 @@ func main() {
 	fmt.Println("\nSummary:")
 	fmt.Println(summary)
 
-	// Send email if configured
-	if len(config.EmailTo) > 0 {
-		subject := fmt.Sprintf("Slack Channel Summary - %s", time.Now().Format("2006-01-02"))
-		if err := sendEmail(config, subject, summary, logger); err != nil {
+	emailSubject := fmt.Sprintf("Shinbun Summary [%s] - %s", flags.Focus, time.Now().Format("2006-01-02"))
+
+	if !flags.DryRun {
+		if err := sendEmail(config, emailSubject, summary, logger); err != nil {
 			logger.Error("Failed to send email", zap.Error(err))
 		}
+	} else {
+		logger.Info("Dry run enabled, skipping email send.")
+		fmt.Println("\n--- Email Subject ---")
+		fmt.Println(emailSubject)
+		fmt.Println("\n--- Email Body (HTML) ---")
+		fmt.Println(summary)
 	}
 }

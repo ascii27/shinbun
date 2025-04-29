@@ -36,15 +36,21 @@ Shinbun (新聞) is a Slack channel digest tool that helps you stay on top of yo
 
 ## Configuration
 
-You can configure the channels to monitor either through command-line flags or using a configuration file at `config.yaml`.
+You configure Shinbun primarily through the `.env` file.
 
 Copy `.env.example` to `.env` and fill in the required values:
 
 ```env
 # Required Configuration
-SLACK_TOKEN=xoxb-your-token
-OPENAI_TOKEN=your-openai-token
-SOURCE_CHANNELS=channel1,channel2
+SLACK_BOT_TOKEN=xoxb-your-token
+OPENAI_API_KEY=sk-your-openai-key
+
+# Channel Focus Categories
+# Define comma-separated lists of channel names for different focus areas.
+# The application will use DEFAULT_FOCUS_CHANNELS unless a --focus is provided.
+DEFAULT_FOCUS_CHANNELS=general,random,announcements
+# Example 'support' focus category (used with --focus support)
+SUPPORT_FOCUS_CHANNELS=support-tier1,helpdesk
 
 # Database Configuration
 DB_HOST=localhost
@@ -64,9 +70,34 @@ EMAIL_TO=recipient1@example.com,recipient2@example.com
 
 ## Usage
 
+Run the application from your terminal:
+
 ```bash
-./shinbun --channels general,team-updates,announcements
+# Run with default focus, fetching messages since last run
+go run main.go 
+
+# Run with 'support' focus
+go run main.go --focus support
+
+# Run with default focus, fetching messages from the last 7 days
+go run main.go --from-date 7d
+
+# Run with default focus, fetching messages since a specific date
+go run main.go --from-date 2025-04-01
+
+# List available channels and exit
+go run main.go --list-channels
+
+# Run in dry-run mode (prints summary/email to console instead of sending)
+go run main.go --dry-run
 ```
+
+**Command-line Flags:**
+
+*   `--focus <category>`: Specify the channel focus category to use (e.g., `default`, `support`). Corresponds to `*_FOCUS_CHANNELS` variables in `.env`. Defaults to `default`.
+*   `--from-date <date|duration>`: Fetch messages starting from a specific date (`YYYY-MM-DD`) or a relative duration (e.g., `24h`, `7d`). If omitted, fetches messages since the last successful run for each channel.
+*   `--list-channels`: List accessible Slack channels (public and private the bot is in) and exit.
+*   `--dry-run`: Execute the process but print the summary and email content to the console instead of sending an email.
 
 ## Email Setup
 
